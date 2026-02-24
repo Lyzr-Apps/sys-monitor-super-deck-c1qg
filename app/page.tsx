@@ -258,10 +258,26 @@ function ResultTable({ resultText, columns, sortCol, sortDir, onSort }: {
   const lines = resultText.split('\n').filter((l) => l.trim())
   const hasHeaders = Array.isArray(columns) && columns.length > 0
   const headerRow = hasHeaders ? columns : []
-  const dataStartIdx = lines.length > 0 && hasHeaders ? 1 : 0
+
+  // Detect if data is KEY=VALUE format (e.g., env vars)
+  const isKeyValue = hasHeaders && headerRow.length === 2 && lines.length > 0 && lines[0].includes('=')
+
+  // Detect if the first line is a header line that matches our columns
+  const firstLineTokens = lines.length > 0 ? lines[0].split(/\s{2,}|\t/).filter((c) => c.trim()) : []
+  const firstLineIsHeader = hasHeaders && firstLineTokens.length > 0 &&
+    headerRow.some((col) => firstLineTokens.some((t) => t.toUpperCase() === col.toUpperCase()))
+  const dataStartIdx = firstLineIsHeader ? 1 : 0
   const dataLines = lines.slice(dataStartIdx)
 
   const rows = dataLines.map((line) => {
+    if (isKeyValue) {
+      // Split on first = only, so PATH=/usr/bin:/sbin keeps value intact
+      const eqIdx = line.indexOf('=')
+      if (eqIdx > 0) {
+        return [line.substring(0, eqIdx), line.substring(eqIdx + 1)]
+      }
+      return [line, '']
+    }
     return line.split(/\s{2,}|\t/).filter((c) => c.trim())
   })
 
@@ -329,10 +345,23 @@ function ProgressBars({ resultText }: { resultText: string }) {
   const entries = lines.map((line) => {
     const percentMatch = line.match(/(\d+)%/)
     const pct = percentMatch ? parseInt(percentMatch[1], 10) : 0
-    const parts = line.split(/\s{2,}|\t/).filter((c) => c.trim())
-    const mountOrName = parts[parts.length - 1] || parts[0] || line.trim()
-    return { name: mountOrName, percent: pct, raw: line }
-  }).filter((e) => e.percent > 0 || e.name)
+    // Try to get a meaningful label: filesystem + mount, or first + last tokens
+    const parts = line.split(/\s+/).filter((c) => c.trim())
+    // For df -h output: /dev/sda1 50G 32G 18G 64% /
+    // Use first part (device) + last part (mount point) as label
+    let label = line.trim()
+    if (parts.length >= 2) {
+      const firstPart = parts[0]
+      const lastPart = parts[parts.length - 1]
+      // Skip if last part is just a percentage
+      if (lastPart.match(/^\d+%$/)) {
+        label = firstPart
+      } else {
+        label = `${firstPart} → ${lastPart}`
+      }
+    }
+    return { name: label, percent: pct, raw: line, detail: line.trim() }
+  }).filter((e) => e.percent > 0)
 
   return (
     <div className="space-y-3">
@@ -353,6 +382,9 @@ function ProgressBars({ resultText }: { resultText: string }) {
               }}
             />
           </div>
+          {entry.detail && (
+            <p className="text-xs mt-0.5 truncate" style={{ color: 'hsl(40, 50%, 25%)' }}>{entry.detail}</p>
+          )}
         </div>
       ))}
       {entries.length === 0 && (
@@ -1004,12 +1036,98 @@ export default function Page() {
       const result = await callAIAgent(q, AGENT_ID)
 
       if (result.success) {
-        let parsed = result?.response?.result
-        if (typeof parsed === 'string') {
+        // ── Deep extraction: try multiple paths to find structured agent data ──
+        let parsed: Record<string, any> = {}
+
+        // Path 1: Try raw_response first — it often contains the real structured JSON
+        // raw_response can be: '{"response":"{...escaped json...}","module_outputs":{}}'
+        if (result.raw_response) {
           try {
-            parsed = JSON.parse(parsed)
+            let rawOuter = typeof result.raw_response === 'string'
+              ? JSON.parse(result.raw_response)
+              : result.raw_response
+            // rawOuter.response may itself be a JSON string
+            let innerResponse = rawOuter?.response ?? rawOuter
+            if (typeof innerResponse === 'string') {
+              try { innerResponse = JSON.parse(innerResponse) } catch {}
+            }
+            // If innerResponse has our expected fields, use it
+            if (innerResponse && typeof innerResponse === 'object' && (innerResponse.command || innerResponse.category || innerResponse.result_type)) {
+              parsed = innerResponse
+            }
           } catch {
-            // use as-is
+            // raw_response was not valid JSON, continue to other paths
+          }
+        }
+
+        // Path 2: If raw_response didn't yield structured data, try result.response.result
+        if (!parsed.command && !parsed.category) {
+          let fromResult = result?.response?.result
+          if (typeof fromResult === 'string') {
+            try { fromResult = JSON.parse(fromResult) } catch {}
+          }
+          if (fromResult && typeof fromResult === 'object') {
+            // Check if it has structured fields directly or nested inside text
+            if (fromResult.command || fromResult.category || fromResult.result_type) {
+              parsed = fromResult
+            } else if (typeof fromResult.text === 'string') {
+              // text might be JSON-encoded structured response
+              try {
+                const textParsed = JSON.parse(fromResult.text)
+                if (textParsed && typeof textParsed === 'object' && (textParsed.command || textParsed.category)) {
+                  parsed = textParsed
+                }
+              } catch {
+                // text is plain text output — use it as the result body
+                parsed = {
+                  query: q,
+                  command: '',
+                  is_safe: true,
+                  category: 'system',
+                  result_type: 'text',
+                  result: fromResult.text,
+                  blocked_reason: '',
+                  columns: [],
+                }
+              }
+            }
+          }
+        }
+
+        // Path 3: If result.response.message holds the data
+        if (!parsed.command && !parsed.result && result?.response?.message) {
+          let msg = result.response.message
+          if (typeof msg === 'string') {
+            try {
+              const msgParsed = JSON.parse(msg)
+              if (msgParsed && typeof msgParsed === 'object' && (msgParsed.command || msgParsed.category)) {
+                parsed = msgParsed
+              }
+            } catch {
+              // message is plain text — use as result
+              if (!parsed.result) {
+                parsed = {
+                  ...parsed,
+                  result: msg,
+                  result_type: parsed.result_type || 'text',
+                }
+              }
+            }
+          }
+        }
+
+        // Final fallback: if we still have nothing, use response.message or text as raw output
+        if (!parsed.result && !parsed.command) {
+          const fallbackText = result?.response?.message || result?.response?.result?.text || ''
+          parsed = {
+            query: q,
+            command: 'N/A — could not parse agent response',
+            is_safe: true,
+            category: 'system',
+            result_type: 'text',
+            result: typeof fallbackText === 'string' ? fallbackText : JSON.stringify(fallbackText, null, 2),
+            blocked_reason: '',
+            columns: [],
           }
         }
 
