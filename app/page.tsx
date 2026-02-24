@@ -271,15 +271,35 @@ function ResultTable({ resultText, columns, sortCol, sortDir, onSort }: {
 
   const rows = dataLines.map((line) => {
     if (isKeyValue) {
+      // Skip bracketed notes like [Additional environment variables...]
+      if (line.trim().startsWith('[') && line.trim().endsWith(']')) {
+        return null
+      }
       // Split on first = only, so PATH=/usr/bin:/sbin keeps value intact
       const eqIdx = line.indexOf('=')
       if (eqIdx > 0) {
         return [line.substring(0, eqIdx), line.substring(eqIdx + 1)]
       }
-      return [line, '']
+      // Lines without = in KEY=VALUE mode — skip them
+      return null
     }
-    return line.split(/\s{2,}|\t/).filter((c) => c.trim())
-  })
+    // For general table data, split by 2+ spaces or tab
+    const cells = line.split(/\s{2,}|\t/).filter((c) => c.trim())
+    // If we couldn't split into multiple cells, try single-space splitting
+    // but only if we have columns to match against
+    if (cells.length <= 1 && headerRow.length > 1) {
+      const spaceSplit = line.trim().split(/\s+/)
+      if (spaceSplit.length >= headerRow.length) {
+        // For commands like ps aux where last column may have spaces,
+        // take first N-1 columns as single tokens, rest as last column
+        const result = spaceSplit.slice(0, headerRow.length - 1)
+        result.push(spaceSplit.slice(headerRow.length - 1).join(' '))
+        return result
+      }
+      return spaceSplit
+    }
+    return cells
+  }).filter((row): row is string[] => row !== null)
 
   const sortedRows = sortCol !== null
     ? [...rows].sort((a, b) => {
@@ -294,42 +314,62 @@ function ResultTable({ resultText, columns, sortCol, sortDir, onSort }: {
       })
     : rows
 
+  const totalRows = sortedRows.length
+
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-xs font-mono tracking-wider" style={{ borderCollapse: 'collapse' }}>
-        {headerRow.length > 0 && (
-          <thead>
-            <tr style={{ borderBottom: '1px solid hsl(40, 50%, 20%)' }}>
-              {headerRow.map((col, i) => (
-                <th
-                  key={i}
-                  className="px-3 py-2 text-left cursor-pointer select-none whitespace-nowrap"
-                  style={{ color: 'hsl(40, 100%, 50%)', background: 'hsl(35, 25%, 10%)' }}
-                  onClick={() => onSort(i)}
-                >
-                  <span className="flex items-center gap-1">
-                    {col}
-                    {sortCol === i && (
-                      <span className="text-xs">{sortDir === 'asc' ? '\u25B2' : '\u25BC'}</span>
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-mono tracking-wider" style={{ color: 'hsl(40, 60%, 35%)' }}>
+          {totalRows} row{totalRows !== 1 ? 's' : ''}
+        </span>
+      </div>
+      <div className="overflow-x-auto" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
+        <table className="w-full text-xs font-mono tracking-wider" style={{ borderCollapse: 'collapse' }}>
+          {headerRow.length > 0 && (
+            <thead className="sticky top-0 z-10">
+              <tr style={{ borderBottom: '1px solid hsl(40, 50%, 20%)' }}>
+                {headerRow.map((col, i) => (
+                  <th
+                    key={i}
+                    className="px-3 py-2 text-left cursor-pointer select-none whitespace-nowrap"
+                    style={{ color: 'hsl(40, 100%, 50%)', background: 'hsl(35, 25%, 10%)' }}
+                    onClick={() => onSort(i)}
+                  >
+                    <span className="flex items-center gap-1">
+                      {col}
+                      {sortCol === i && (
+                        <span className="text-xs">{sortDir === 'asc' ? '\u25B2' : '\u25BC'}</span>
+                      )}
+                    </span>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+          )}
+          <tbody>
+            {sortedRows.map((row, ri) => (
+              <tr key={ri} style={{ borderBottom: '1px solid hsl(40, 50%, 12%)', background: ri % 2 === 0 ? 'transparent' : 'hsl(35, 18%, 6%)' }}>
+                {row.map((cell, ci) => (
+                  <td
+                    key={ci}
+                    className={cn(
+                      'px-3 py-1.5',
+                      // First column (keys/identifiers) stays nowrap, value columns can wrap
+                      ci === 0 ? 'whitespace-nowrap' : 'break-all'
                     )}
-                  </span>
-                </th>
-              ))}
-            </tr>
-          </thead>
-        )}
-        <tbody>
-          {sortedRows.map((row, ri) => (
-            <tr key={ri} style={{ borderBottom: '1px solid hsl(40, 50%, 12%)', background: ri % 2 === 0 ? 'transparent' : 'hsl(35, 18%, 6%)' }}>
-              {row.map((cell, ci) => (
-                <td key={ci} className="px-3 py-1.5 whitespace-nowrap" style={{ color: 'hsl(40, 90%, 55%)' }}>
-                  {cell}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+                    style={{
+                      color: 'hsl(40, 90%, 55%)',
+                      maxWidth: ci > 0 ? '500px' : undefined,
+                    }}
+                  >
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
       {sortedRows.length === 0 && (
         <p className="text-xs text-center py-4" style={{ color: 'hsl(40, 60%, 35%)' }}>No data rows parsed</p>
       )}
@@ -399,17 +439,24 @@ function ProgressBars({ resultText }: { resultText: string }) {
 function TextResult({ resultText }: { resultText: string }) {
   const lines = resultText.split('\n')
   return (
-    <div className="overflow-x-auto font-mono text-xs tracking-wider">
-      <pre className="whitespace-pre">
-        {lines.map((line, i) => (
-          <div key={i} className="flex">
-            <span className="w-10 text-right pr-3 select-none flex-shrink-0" style={{ color: 'hsl(40, 50%, 25%)' }}>
-              {i + 1}
-            </span>
-            <span style={{ color: 'hsl(40, 90%, 55%)' }}>{line}</span>
-          </div>
-        ))}
-      </pre>
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-mono tracking-wider" style={{ color: 'hsl(40, 60%, 35%)' }}>
+          {lines.length} line{lines.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+      <div className="overflow-x-auto font-mono text-xs tracking-wider" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
+        <pre className="whitespace-pre">
+          {lines.map((line, i) => (
+            <div key={i} className="flex hover:bg-[hsla(40,100%,50%,0.05)]">
+              <span className="w-10 text-right pr-3 select-none flex-shrink-0" style={{ color: 'hsl(40, 50%, 25%)' }}>
+                {i + 1}
+              </span>
+              <span className="break-all" style={{ color: 'hsl(40, 90%, 55%)' }}>{line}</span>
+            </div>
+          ))}
+        </pre>
+      </div>
     </div>
   )
 }
@@ -591,7 +638,7 @@ function DashboardScreen({
                 </div>
               </div>
             ) : (
-              <ScrollArea className="flex-1">
+              <div className="flex-1 overflow-y-auto overflow-x-hidden">
                 <div className="p-4 space-y-4">
                   {/* Command Badge */}
                   <div className="flex items-start gap-2">
@@ -684,7 +731,7 @@ function DashboardScreen({
                     </div>
                   )}
                 </div>
-              </ScrollArea>
+              </div>
             )}
           </div>
         </div>
