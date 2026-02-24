@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useCallback, useRef } from 'react'
+import React, { useState, useCallback, useRef, useEffect } from 'react'
 import { callAIAgent } from '@/lib/aiAgent'
 import { VscTerminal, VscServer, VscHistory, VscSettingsGear, VscSearch, VscPlay, VscCopy, VscChevronDown, VscChevronRight, VscShield, VscWarning, VscRefresh } from 'react-icons/vsc'
 import { cn } from '@/lib/utils'
@@ -1064,9 +1064,111 @@ export default function Page() {
     pageSize: 50,
   })
   const [healthData, setHealthData] = useState({ cpu: '-- %', memory: '-- %', disk: '-- %', uptime: '--' })
-  const [isConnected, setIsConnected] = useState(true)
+  const [isConnected, setIsConnected] = useState(false)
   const [showSample, setShowSample] = useState(false)
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null)
+
+  // ── Fetch real system health data on mount + interval ──
+  const fetchHealthData = useCallback(async () => {
+    try {
+      const res = await fetch('/api/system?cmd=summary')
+      const data = await res.json()
+      if (data.success && data.data) {
+        setHealthData(data.data)
+        setIsConnected(true)
+      }
+    } catch {
+      setIsConnected(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchHealthData()
+    const interval = setInterval(fetchHealthData, 15000) // refresh every 15s
+    return () => clearInterval(interval)
+  }, [fetchHealthData])
+
+  // ── Helper: extract structured data from agent response ──
+  const extractAgentData = (result: any, q: string): Record<string, any> => {
+    let parsed: Record<string, any> = {}
+
+    // Path 1: raw_response (double-escaped JSON)
+    if (result.raw_response) {
+      try {
+        let rawOuter = typeof result.raw_response === 'string'
+          ? JSON.parse(result.raw_response)
+          : result.raw_response
+        let innerResponse = rawOuter?.response ?? rawOuter
+        if (typeof innerResponse === 'string') {
+          try { innerResponse = JSON.parse(innerResponse) } catch {}
+        }
+        if (innerResponse && typeof innerResponse === 'object' && (innerResponse.command || innerResponse.category || innerResponse.result_type)) {
+          parsed = innerResponse
+        }
+      } catch {}
+    }
+
+    // Path 2: result.response.result
+    if (!parsed.command && !parsed.category) {
+      let fromResult = result?.response?.result
+      if (typeof fromResult === 'string') {
+        try { fromResult = JSON.parse(fromResult) } catch {}
+      }
+      if (fromResult && typeof fromResult === 'object') {
+        if (fromResult.command || fromResult.category || fromResult.result_type) {
+          parsed = fromResult
+        } else if (typeof fromResult.text === 'string') {
+          try {
+            const textParsed = JSON.parse(fromResult.text)
+            if (textParsed && typeof textParsed === 'object' && (textParsed.command || textParsed.category)) {
+              parsed = textParsed
+            }
+          } catch {
+            parsed = { query: q, command: '', is_safe: true, category: 'system', result_type: 'text', result: fromResult.text, blocked_reason: '', columns: [] }
+          }
+        }
+      }
+    }
+
+    // Path 3: result.response.message
+    if (!parsed.command && !parsed.result && result?.response?.message) {
+      const msg = result.response.message
+      if (typeof msg === 'string') {
+        try {
+          const msgParsed = JSON.parse(msg)
+          if (msgParsed && typeof msgParsed === 'object' && (msgParsed.command || msgParsed.category)) {
+            parsed = msgParsed
+          }
+        } catch {
+          if (!parsed.result) {
+            parsed = { ...parsed, result: msg, result_type: parsed.result_type || 'text' }
+          }
+        }
+      }
+    }
+
+    // Fallback
+    if (!parsed.result && !parsed.command) {
+      const fallbackText = result?.response?.message || result?.response?.result?.text || ''
+      parsed = { query: q, command: '', is_safe: true, category: 'system', result_type: 'text', result: typeof fallbackText === 'string' ? fallbackText : JSON.stringify(fallbackText, null, 2), blocked_reason: '', columns: [] }
+    }
+
+    return parsed
+  }
+
+  // ── Execute command on actual system via /api/system ──
+  const executeOnSystem = async (command: string): Promise<{ success: boolean; output?: string; error?: string; blocked?: boolean }> => {
+    try {
+      const res = await fetch('/api/system', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command }),
+      })
+      return await res.json()
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to execute command' }
+    }
+  }
 
   const handleRunQuery = useCallback(async (queryOverride?: string) => {
     const q = queryOverride ?? query
@@ -1080,113 +1182,55 @@ export default function Page() {
     if (queryOverride) setQuery(queryOverride)
 
     try {
+      // Step 1: Ask the agent to interpret the query and get the command
       const result = await callAIAgent(q, AGENT_ID)
 
       if (result.success) {
-        // ── Deep extraction: try multiple paths to find structured agent data ──
-        let parsed: Record<string, any> = {}
+        const parsed = extractAgentData(result, q)
 
-        // Path 1: Try raw_response first — it often contains the real structured JSON
-        // raw_response can be: '{"response":"{...escaped json...}","module_outputs":{}}'
-        if (result.raw_response) {
-          try {
-            let rawOuter = typeof result.raw_response === 'string'
-              ? JSON.parse(result.raw_response)
-              : result.raw_response
-            // rawOuter.response may itself be a JSON string
-            let innerResponse = rawOuter?.response ?? rawOuter
-            if (typeof innerResponse === 'string') {
-              try { innerResponse = JSON.parse(innerResponse) } catch {}
-            }
-            // If innerResponse has our expected fields, use it
-            if (innerResponse && typeof innerResponse === 'object' && (innerResponse.command || innerResponse.category || innerResponse.result_type)) {
-              parsed = innerResponse
-            }
-          } catch {
-            // raw_response was not valid JSON, continue to other paths
-          }
-        }
+        const agentCommand = parsed?.command || ''
+        const isSafe = parsed?.is_safe !== false
+        const category = parsed?.category || 'system'
+        const resultType = parsed?.result_type || 'text'
+        const blockedReason = parsed?.blocked_reason || ''
+        const columns = Array.isArray(parsed?.columns) ? parsed.columns : []
 
-        // Path 2: If raw_response didn't yield structured data, try result.response.result
-        if (!parsed.command && !parsed.category) {
-          let fromResult = result?.response?.result
-          if (typeof fromResult === 'string') {
-            try { fromResult = JSON.parse(fromResult) } catch {}
-          }
-          if (fromResult && typeof fromResult === 'object') {
-            // Check if it has structured fields directly or nested inside text
-            if (fromResult.command || fromResult.category || fromResult.result_type) {
-              parsed = fromResult
-            } else if (typeof fromResult.text === 'string') {
-              // text might be JSON-encoded structured response
-              try {
-                const textParsed = JSON.parse(fromResult.text)
-                if (textParsed && typeof textParsed === 'object' && (textParsed.command || textParsed.category)) {
-                  parsed = textParsed
-                }
-              } catch {
-                // text is plain text output — use it as the result body
-                parsed = {
-                  query: q,
-                  command: '',
-                  is_safe: true,
-                  category: 'system',
-                  result_type: 'text',
-                  result: fromResult.text,
-                  blocked_reason: '',
-                  columns: [],
-                }
-              }
-            }
-          }
-        }
+        // Step 2: If the command is safe and we have one, execute it on the real system
+        let realOutput = parsed?.result || ''
 
-        // Path 3: If result.response.message holds the data
-        if (!parsed.command && !parsed.result && result?.response?.message) {
-          let msg = result.response.message
-          if (typeof msg === 'string') {
-            try {
-              const msgParsed = JSON.parse(msg)
-              if (msgParsed && typeof msgParsed === 'object' && (msgParsed.command || msgParsed.category)) {
-                parsed = msgParsed
-              }
-            } catch {
-              // message is plain text — use as result
-              if (!parsed.result) {
-                parsed = {
-                  ...parsed,
-                  result: msg,
-                  result_type: parsed.result_type || 'text',
-                }
-              }
+        if (isSafe && agentCommand && resultType !== 'blocked') {
+          const sysResult = await executeOnSystem(agentCommand)
+          if (sysResult.success && sysResult.output) {
+            realOutput = sysResult.output
+          } else if (sysResult.blocked) {
+            // Command was blocked by our safety filter
+            const monitorResult: MonitorResult = {
+              query: parsed?.query || q,
+              command: agentCommand,
+              is_safe: false,
+              category: 'blocked',
+              result_type: 'blocked',
+              result: '',
+              blocked_reason: sysResult.error || 'Command blocked by system safety filter',
+              columns: [],
             }
+            setCurrentResult(monitorResult)
+            setHistory((prev) => [{ id: Date.now().toString(), timestamp: new Date(), ...monitorResult, expanded: false }, ...prev])
+            setIsConnected(true)
+            return
           }
-        }
-
-        // Final fallback: if we still have nothing, use response.message or text as raw output
-        if (!parsed.result && !parsed.command) {
-          const fallbackText = result?.response?.message || result?.response?.result?.text || ''
-          parsed = {
-            query: q,
-            command: 'N/A — could not parse agent response',
-            is_safe: true,
-            category: 'system',
-            result_type: 'text',
-            result: typeof fallbackText === 'string' ? fallbackText : JSON.stringify(fallbackText, null, 2),
-            blocked_reason: '',
-            columns: [],
-          }
+          // If system execution failed, fall back to agent's simulated output
         }
 
         const monitorResult: MonitorResult = {
           query: parsed?.query || q,
-          command: parsed?.command || '',
-          is_safe: parsed?.is_safe !== false,
-          category: parsed?.category || 'system',
-          result_type: parsed?.result_type || 'text',
-          result: parsed?.result || '',
-          blocked_reason: parsed?.blocked_reason || '',
-          columns: Array.isArray(parsed?.columns) ? parsed.columns : [],
+          command: agentCommand,
+          is_safe: isSafe,
+          category,
+          result_type: resultType,
+          result: realOutput,
+          blocked_reason: blockedReason,
+          columns,
         }
 
         setCurrentResult(monitorResult)
@@ -1208,6 +1252,8 @@ export default function Page() {
           ...prev,
         ])
         setIsConnected(true)
+        // Refresh health cards after each query
+        fetchHealthData()
       } else {
         setError(result?.error || 'Failed to get response from agent')
         setIsConnected(false)
@@ -1219,7 +1265,7 @@ export default function Page() {
       setIsLoading(false)
       setActiveAgentId(null)
     }
-  }, [query, isLoading])
+  }, [query, isLoading, fetchHealthData])
 
   const handleRerun = useCallback((rerunQuery: string) => {
     setQuery(rerunQuery)
