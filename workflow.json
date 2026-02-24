@@ -1,0 +1,32 @@
+{
+  "nodes": [
+    {
+      "id": "input_node",
+      "type": "Input",
+      "label": "User Query",
+      "nodeCategory": "input"
+    },
+    {
+      "id": "system_monitor_agent",
+      "type": "Agent",
+      "label": "System Monitor Agent",
+      "nodeCategory": "agent"
+    },
+    {
+      "id": "output_node",
+      "type": "Output",
+      "label": "Dashboard Output",
+      "nodeCategory": "end"
+    }
+  ],
+  "edges": [
+    {
+      "source": "input_node",
+      "target": "system_monitor_agent"
+    },
+    {
+      "source": "system_monitor_agent",
+      "target": "output_node"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "agent_id": "699d89ae82438d9777adbe5f",
+  "agent_name": "System Monitor Agent",
+  "agent_type": "json",
+  "accessor": "json",
+  "has_module_outputs": false,
+  "response_schema": {
+    "query": "string",
+    "command": "string",
+    "is_safe": "boolean",
+    "category": "string - process|memory|disk|network|system|environment|logs|blocked",
+    "result_type": "string - table|progress_bar|text|blocked",
+    "result": "string",
+    "blocked_reason": "string",
+    "columns": "array of strings"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "agents": {
+    "system_monitor_agent": {
+      "agent_id": "699d89ae82438d9777adbe5f",
+      "name": "System Monitor Agent",
+      "type": "single"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "agent_name": "System Monitor Agent",
+  "agent_id": "699d89ae82438d9777adbe5f",
+  "description": "Interprets natural language system monitoring requests, translates them into appropriate shell/system commands (ps, top, df, env, netstat, uptime, free, etc.), validates commands are read-only and safe, and returns structured formatted results. Refuses destructive operations (rm, kill, shutdown, etc.) with clear warnings.",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "response_schema": {
+    "query": "string",
+    "command": "string",
+    "is_safe": "boolean",
+    "category": "string",
+    "result_type": "string",
+    "result": "string",
+    "blocked_reason": "string",
+    "columns": [
+      "string"
+    ]
+  },
+  "example_response": {
+    "query": "The original natural language query",
+    "command": "The translated shell command",
+    "is_safe": false,
+    "category": "Command category: process, memory, disk, network, system, environment, logs, or blocked",
+    "result_type": "How to render the result: table, progress_bar, text, or blocked",
+    "result": "The command output or structured data as a string",
+    "blocked_reason": "Reason the command was blocked, or empty string if not blocked",
+    "columns": [
+      "sample string"
+    ]
+  }
+}
